@@ -1,0 +1,20 @@
+# @package _global_
+module:
+  _target_: emg2qwerty.lightning.EncoderCTCModule
+  in_features: 528  # freq * channels = (n_fft // 2 + 1) * 16
+  mlp_features: [384]
+  encoder:
+    _target_: emg2qwerty.modules.ConvRecurrentEncoder
+    block_channels: [24, 24]  # 2 TDS conv blocks (loses 62 frames), then a GRU
+    kernel_width: 32
+    hidden_size: 256
+    num_layers: 2
+    bidirectional: false
+    dropout: 0.1
+    rnn_type: gru  # "gru" or "lstm"
+    context_frames: 124  # Matches TDS baseline: 4 conv blocks x (kernel_width 32 - 1)
+
+datamodule:
+  _target_: emg2qwerty.lightning.WindowedEMGDataModule
+  window_length: 8000  # 4 sec windows for 2kHz EMG
+  padding: [1800, 200]  # 900ms past context, 100ms future context

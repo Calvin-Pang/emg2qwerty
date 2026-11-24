@@ -23,6 +23,7 @@ from emg2qwerty.data import LabelData, WindowedEMGDataset
 from emg2qwerty.metrics import CharacterErrorRates
 from emg2qwerty.modules import (
     MultiBandRotationInvariantMLP,
+    RecurrentEncoder,
     SpectrogramNorm,
     TDSConvEncoder,
 )
@@ -268,4 +269,138 @@ class TDSConvCTCModule(pl.LightningModule):
             self.parameters(),
             optimizer_config=self.hparams.optimizer,
             lr_scheduler_config=self.hparams.lr_scheduler,
+        )
+
+
+class RecurrentCTCModule(TDSConvCTCModule):
+    """Same pipeline as `TDSConvCTCModule` (spectrogram norm, per-band rotation
+    invariant MLP, CTC loss, CER metrics), with the `TDSConvEncoder` replaced by a
+    GRU/LSTM `RecurrentEncoder`. The step, epoch-end and optimizer logic is
+    inherited unchanged."""
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        hidden_size: int,
+        num_layers: int,
+        bidirectional: bool,
+        dropout: float,
+        rnn_type: str,
+        context_frames: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+    ) -> None:
+        # Skip `TDSConvCTCModule.__init__`, which would build the TDS encoder.
+        # NOTE: this must be a `super(...)` call (not `pl.LightningModule.__init__`)
+        # so that `save_hyperparameters()` below picks up this class' init args.
+        super(TDSConvCTCModule, self).__init__()
+        self.save_hyperparameters()
+
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        encoder = RecurrentEncoder(
+            num_features=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+            dropout=dropout,
+            rnn_type=rnn_type,
+            context_frames=context_frames,
+        )
+
+        # Model
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            # (T - context_frames, N, hidden_size * num_directions)
+            encoder,
+            # (T - context_frames, N, num_classes)
+            nn.Linear(encoder.output_size, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+        # Criterion
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
+
+        # Decoder
+        self.decoder = instantiate(decoder)
+
+        # Metrics
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict(
+            {
+                f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+                for phase in ["train", "val", "test"]
+            }
+        )
+
+
+class EncoderCTCModule(TDSConvCTCModule):
+    """Same pipeline as `TDSConvCTCModule`, with the `TDSConvEncoder` replaced by any
+    encoder given by the ``encoder`` config (a Hydra config with ``_target_``). The
+    encoder is built with ``num_features`` and must map (T, N, num_features) to
+    (T - 124, N, encoder.output_size), so emissions stay aligned with the labels
+    as for the baseline. The step, epoch-end and optimizer logic is inherited."""
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        encoder: DictConfig,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+    ) -> None:
+        # Skip `TDSConvCTCModule.__init__`, which would build the TDS encoder.
+        # NOTE: this must be a `super(...)` call (not `pl.LightningModule.__init__`)
+        # so that `save_hyperparameters()` below picks up this class' init args.
+        super(TDSConvCTCModule, self).__init__()
+        self.save_hyperparameters()
+
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        encoder_module = instantiate(encoder, num_features=num_features)
+
+        # Model
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            # (T - 124, N, encoder.output_size)
+            encoder_module,
+            # (T - 124, N, num_classes)
+            nn.Linear(encoder_module.output_size, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+        # Criterion
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
+
+        # Decoder
+        self.decoder = instantiate(decoder)
+
+        # Metrics
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict(
+            {
+                f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+                for phase in ["train", "val", "test"]
+            }
         )

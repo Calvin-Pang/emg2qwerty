@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -278,3 +279,220 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+
+class RecurrentEncoder(nn.Module):
+    """A GRU or LSTM encoder for inputs of shape (T, N, num_features).
+
+    Unlike `TDSConvEncoder`, a recurrent layer does not shorten the time axis.
+    The first ``context_frames`` outputs are therefore dropped so that the output
+    has T - context_frames steps, exactly as for `TDSConvEncoder`. With the default
+    ``context_frames=124`` (4 TDS conv blocks, each losing kernel_width - 1 = 31
+    frames), the emissions stay aligned with the labels, which only cover the
+    un-padded window, and the CTC length logic in ``lightning.py`` is unchanged.
+
+    Args:
+        num_features (int): ``num_features`` for an input of shape
+            (T, N, num_features).
+        hidden_size (int): Hidden size of the recurrent layers per direction.
+        num_layers (int): Number of stacked recurrent layers.
+        bidirectional (bool): Whether the recurrent layers are bidirectional.
+        dropout (float): Dropout between stacked recurrent layers (only applied
+            when ``num_layers > 1``).
+        rnn_type (str): Either "gru" or "lstm".
+        context_frames (int): Number of leading output frames to drop.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        bidirectional: bool = False,
+        dropout: float = 0.1,
+        rnn_type: str = "gru",
+        context_frames: int = 124,
+    ) -> None:
+        super().__init__()
+
+        assert rnn_type in {"gru", "lstm"}, f"Unsupported rnn_type: {rnn_type}"
+        assert context_frames >= 0
+        rnn_cls = nn.GRU if rnn_type == "gru" else nn.LSTM
+        # batch_first defaults to False, so inputs and outputs are (T, N, ...)
+        self.rnn = rnn_cls(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+        )
+        self.context_frames = context_frames
+        self.output_size = hidden_size * (2 if bidirectional else 1)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        x, _ = self.rnn(inputs)  # (T, N, output_size)
+        return x[self.context_frames :]  # (T - context_frames, N, output_size)
+
+
+class ConvRecurrentEncoder(nn.Module):
+    """A CNN + RNN hybrid encoder for inputs of shape (T, N, num_features):
+    a (shallow) `TDSConvEncoder` followed by a `RecurrentEncoder`.
+
+    The convolutions shorten the time axis by ``len(block_channels) *
+    (kernel_width - 1)`` frames and the recurrent encoder drops the remaining
+    ``context_frames`` minus that amount, so that the output has exactly
+    T - context_frames steps, as for `TDSConvEncoder`.
+
+    Args:
+        num_features (int): ``num_features`` for an input of shape
+            (T, N, num_features).
+        block_channels (list): Number of channels per `TDSConv2dBlock`.
+        kernel_width (int): The kernel size of the temporal convolutions.
+        hidden_size (int): Hidden size of the recurrent layers per direction.
+        num_layers (int): Number of stacked recurrent layers.
+        bidirectional (bool): Whether the recurrent layers are bidirectional.
+        dropout (float): Dropout between stacked recurrent layers.
+        rnn_type (str): Either "gru" or "lstm".
+        context_frames (int): Total number of leading frames to drop (conv
+            receptive field plus recurrent warm-up). Must be at least the
+            frames already lost to the convolutions.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        block_channels: Sequence[int] = (24, 24),
+        kernel_width: int = 32,
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        bidirectional: bool = False,
+        dropout: float = 0.1,
+        rnn_type: str = "gru",
+        context_frames: int = 124,
+    ) -> None:
+        super().__init__()
+
+        conv_frames_lost = len(block_channels) * (kernel_width - 1)
+        assert conv_frames_lost <= context_frames, (
+            f"Convolutions already lose {conv_frames_lost} frames, "
+            f"which exceeds context_frames={context_frames}"
+        )
+        self.conv = TDSConvEncoder(
+            num_features=num_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+        )
+        self.rnn = RecurrentEncoder(
+            num_features=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+            dropout=dropout,
+            rnn_type=rnn_type,
+            context_frames=context_frames - conv_frames_lost,
+        )
+        self.output_size = self.rnn.output_size
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.rnn(self.conv(inputs))  # (T - context_frames, N, output_size)
+
+
+class ChunkedTransformerEncoder(nn.Module):
+    """A Transformer encoder for inputs of shape (T, N, num_features) that applies
+    self-attention within non-overlapping blocks of ``chunk_size`` frames.
+
+    Full self-attention over a whole test session (tens of thousands of frames)
+    does not fit in memory, so attention is block-local, which works for any
+    sequence length. Sinusoidal positional encodings are relative to the start of
+    each block. As in `RecurrentEncoder`, the first ``context_frames`` outputs are
+    dropped so the output has T - context_frames steps, as for `TDSConvEncoder`.
+
+    Args:
+        num_features (int): ``num_features`` for an input of shape
+            (T, N, num_features).
+        d_model (int): Transformer width. Must be even and divisible by
+            ``num_heads``.
+        num_layers (int): Number of Transformer encoder layers.
+        num_heads (int): Number of attention heads.
+        dim_feedforward (int): Hidden size of the feedforward blocks.
+        dropout (float): Dropout inside the Transformer layers.
+        chunk_size (int): Number of frames attended to jointly (125 frames = 1 s).
+        context_frames (int): Number of leading output frames to drop.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        d_model: int = 256,
+        num_layers: int = 4,
+        num_heads: int = 4,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        chunk_size: int = 128,
+        context_frames: int = 124,
+    ) -> None:
+        super().__init__()
+
+        assert d_model % 2 == 0 and d_model % num_heads == 0
+        assert chunk_size > 0 and context_frames >= 0
+        self.chunk_size = chunk_size
+        self.context_frames = context_frames
+        self.output_size = d_model
+
+        self.input_proj = nn.Linear(num_features, d_model)
+
+        # Sinusoidal positional encoding within a chunk: (chunk_size, 1, d_model)
+        position = torch.arange(chunk_size).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        )
+        pe = torch.zeros(chunk_size, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=False,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            layer,
+            num_layers=num_layers,
+            norm=nn.LayerNorm(d_model),
+            enable_nested_tensor=False,
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        T, N, _ = inputs.shape
+        x = self.input_proj(inputs)  # (T, N, d_model)
+        d_model = x.shape[-1]
+
+        # Pad time to a multiple of chunk_size, then fold chunks into the batch:
+        # (T, N, d) -> (chunk_size, num_chunks * N, d)
+        pad = (-T) % self.chunk_size
+        if pad > 0:
+            x = nn.functional.pad(x, (0, 0, 0, 0, 0, pad))
+        num_chunks = (T + pad) // self.chunk_size
+        x = x.reshape(num_chunks, self.chunk_size, N, d_model)
+        x = x.permute(1, 0, 2, 3).reshape(self.chunk_size, num_chunks * N, d_model)
+        x = x + self.pe
+
+        # Mask the padded frames of the last chunk as attention keys
+        key_padding_mask = None
+        if pad > 0:
+            frame_idx = torch.arange(T + pad, device=x.device).reshape(
+                num_chunks, self.chunk_size
+            )
+            mask = (frame_idx >= T)[:, None, :].expand(num_chunks, N, self.chunk_size)
+            key_padding_mask = mask.reshape(num_chunks * N, self.chunk_size)
+
+        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
+
+        # Unfold chunks: (chunk_size, num_chunks * N, d) -> (T, N, d)
+        x = x.reshape(self.chunk_size, num_chunks, N, d_model).permute(1, 0, 2, 3)
+        x = x.reshape(num_chunks * self.chunk_size, N, d_model)[:T]
+        return x[self.context_frames :]  # (T - context_frames, N, d_model)
