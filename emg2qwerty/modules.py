@@ -278,3 +278,79 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+class MyoTextConv1dBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int = 128, kernel_width: int = 7, use_maxpool: bool = False) -> None:
+        super().__init__()
+        self.conv1d = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=(kernel_width,),
+            bias=True,
+        )
+        self.batchnorm = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU()
+        self.use_maxpool = use_maxpool
+        if self.use_maxpool:
+            self.maxpool = nn.MaxPool1d(kernel_size=2)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        T_in, N, C = inputs.shape
+
+        # TNC -> NCT
+        x = inputs.movedim(0, -1)
+        conv_out = self.conv1d(x)
+        batchnorm_out = self.batchnorm(conv_out)
+        relu_out = self.relu(batchnorm_out)
+        if self.use_maxpool:
+            out = self.maxpool(relu_out)
+        else:
+            out = relu_out
+        return out.movedim(-1, 0) # NCT -> TNC
+
+class MyoTextBiLSTMBlock(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int = 128, num_layers: int = 2, batch_first: bool = False, dropout: float = 0.2, bidirectional: bool = True) -> None:
+        super().__init__()
+        self.bilstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, batch_first=batch_first, dropout=dropout, bidirectional=bidirectional)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        output, _ = self.bilstm(inputs)
+        return output # TNC
+
+class MyoTextAttentionBlock(nn.Module):
+    def __init__(self, hidden_dim: int = 256, attn_dim: int = 128) -> None:
+        super().__init__()
+        self.rel_score = nn.Sequential(
+            nn.Linear(hidden_dim, attn_dim),
+            nn.Tanh(),
+            nn.Linear(attn_dim, 1, bias=False),
+        )
+        # self.softmax = nn.Softmax(dim=0)
+        # change added to break 89 Val/CER
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        rel_scores = self.rel_score(inputs)
+        weights = self.sigmoid(rel_scores)
+        context_vec = inputs * weights
+        # added residual pass to maintain gradient flow, fixed vanishing gradient
+        return inputs + context_vec # (T, N, hidden_dim)
+
+class MyoTextFullyConnectedBlock(nn.Module):
+    def __init__(self, input_dim: int = 256, hidden_dim: int = 128, num_classes: int = 26, dropout: float = 0.2) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim, bias=True)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=dropout)
+        # self.batchnorm = nn.BatchNorm1d(hidden_dim) # removed to improve Val/CER
+        self.layernorm = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, num_classes, bias=True)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        fc1_out = self.fc1(inputs)
+        relu_out = self.relu(fc1_out)
+        drop_out = self.dropout(relu_out)
+        # TNC -> NCT
+        # z = self.batchnorm(drop_out.movedim(0, -1)).movedim(-1, 0)
+        z = self.layernorm(drop_out)
+        return self.fc2(z) # (T, N, hidden_dim)

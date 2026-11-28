@@ -25,6 +25,10 @@ from emg2qwerty.modules import (
     MultiBandRotationInvariantMLP,
     SpectrogramNorm,
     TDSConvEncoder,
+    MyoTextConv1dBlock,
+    MyoTextBiLSTMBlock,
+    MyoTextAttentionBlock,
+    MyoTextFullyConnectedBlock,
 )
 from emg2qwerty.transforms import Transform
 
@@ -269,3 +273,93 @@ class TDSConvCTCModule(pl.LightningModule):
             optimizer_config=self.hparams.optimizer,
             lr_scheduler_config=self.hparams.lr_scheduler,
         )
+
+class MyoTextCTCModule(TDSConvCTCModule):
+    def __init__(
+            self,
+            in_features: int,
+            mlp_features: Sequence[int],
+            block_channels: Sequence[int],
+            kernel_width: int,
+            optimizer: DictConfig,
+            lr_scheduler: DictConfig,
+            decoder: DictConfig,
+    ) -> None:
+        super().__init__(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+        self.save_hyperparameters()
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        
+        # Model
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            # add 2 convolutional blocks here
+            MyoTextConv1dBlock(num_features, block_channels[0], kernel_width, use_maxpool=True),
+            MyoTextConv1dBlock(block_channels[0], block_channels[1], kernel_width, use_maxpool=False),
+            # (T, N, block_channels[1])
+            # BiLSTM layer here
+            MyoTextBiLSTMBlock(input_size=block_channels[1], hidden_size=128, num_layers=2, batch_first=False, dropout=0.2, bidirectional=True),
+            # Attention layer here
+            # (T, N, 256)
+            MyoTextAttentionBlock(256, 128),
+            MyoTextFullyConnectedBlock(256, 128, num_classes=charset().num_classes, dropout=0.1), # decreased dropout 0.2 -> 0.1
+            # (T, N, num_classes)
+            nn.LogSoftmax(dim=-1),
+            )
+
+    def _step(
+        self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
+    ) -> torch.Tensor:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)
+
+        emissions = self.forward(inputs)
+
+        L1 = torch.div(input_lengths - (self.hparams.kernel_width - 1), 2, rounding_mode="floor")
+
+        emission_lengths = L1 - (self.hparams.kernel_width - 1)
+
+        loss = self.ctc_loss(
+        log_probs=emissions,  # (T, N, num_classes)
+        targets=targets.transpose(0, 1),  # (T, N) -> (N, T)
+        input_lengths=emission_lengths,  # (N,)
+        target_lengths=target_lengths,  # (N,)
+        )
+
+        # Decode emissions
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        # Update metrics
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets = targets.detach().cpu().numpy()
+        target_lengths = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            # Unpad targets (T, N) for batch entry
+            target = LabelData.from_labels(targets[: target_lengths[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
